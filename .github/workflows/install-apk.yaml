@@ -1,5 +1,5 @@
 name: Install Extract APK
-run-name: Install Extract - ${{inputs.run_name}}
+run-name: ${{ github.event_name == 'workflow_dispatch' && format('Install Extract - {0}', github.event.inputs.run_name) || 'Install Extract APK' }}
 
 on:
   push:
@@ -29,6 +29,7 @@ jobs:
     runs-on: ubuntu-latest    
     outputs:
       apkpaths: ${{ steps.getpaths.outputs.apkpaths }}
+      matrix: ${{ steps.getpaths.outputs.matrix }}
     steps:      
       - name: Checkout code
         uses: actions/checkout@v4
@@ -47,9 +48,42 @@ jobs:
 
       - name: Setup paths
         id: getpaths
-        run: |                              
-          echo "apkpaths=$(python -c 'import pathlib; print([str(file) for file in pathlib.Path.glob(pathlib.Path("${{env.all_apk_dir}}"),"**/*.apk")])')" >> "$GITHUB_OUTPUT"          
         shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import pathlib
+          import zipfile
+
+          apk_dir = pathlib.Path(os.environ["APK_DIR"])
+          allowed_abis = {"arm64-v8a", "armeabi-v7a", "x86", "x86_64"}
+          apk_paths = [str(path) for path in apk_dir.rglob("*.apk")]
+          matrix = []
+
+          for path in apk_dir.rglob("*.apk"):
+              abis = set()
+              try:
+                  with zipfile.ZipFile(path) as zf:
+                      for name in zf.namelist():
+                          if name.startswith("lib/") and name.count("/") >= 2:
+                              abi = name.split("/")[1]
+                              if abi in allowed_abis:
+                                  abis.add(abi)
+              except zipfile.BadZipFile:
+                  continue
+
+              # 如果没有 native 库，则认为对所有默认 ABI 都可用
+              target_abis = sorted(abis) if abis else sorted(allowed_abis)
+              for abi in target_abis:
+                  matrix.append({"apkpath": str(path), "arch": abi})
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"apkpaths={json.dumps(apk_paths)}\n")
+              fh.write(f"matrix={json.dumps(matrix)}\n")
+          PY
+        env:
+          APK_DIR: ${{ env.all_apk_dir }}
       - name: Upload APKs
         uses: actions/upload-artifact@v4
         with:
@@ -62,23 +96,26 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      matrix:        
-        apkpath: ${{fromJson(needs.generate-matrix.outputs.apkpaths)}}
-        arch: ['arm64-v8a', 'armeabi-v7a', 'x86', 'x86_64']        
+      matrix:
+        include: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
       - name : install adb
         run: | 
-          sudo apt install adb aapt
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y adb aapt
       - name: Install reDroid dependencies
         run: |
+          set -euxo pipefail
           ## install required kernel modules          
-          sudo apt install linux-modules-extra-`uname -r`
+          sudo apt-get install -y linux-modules-extra-`uname -r`
           sudo modprobe binder_linux devices="binder,hwbinder,vndbinder"
           #sudo modprobe ashmem_linux          
       - name: Run emulator
         run: |
+          set -euxo pipefail
           mkdir data
           docker run -itd --rm --privileged --pull always -v $(pwd)/data:/data -p ${{env.avd_port}}:5555 redroid/redroid:12.0.0-latest          
 
@@ -91,7 +128,17 @@ jobs:
 
       - name: adb connect install
         run: |                    
-          adb connect ${{env.avd_name}}
+          set -euxo pipefail
+          adb start-server
+          for i in {1..30}; do
+            adb connect ${{env.avd_name}} || true
+            adb -s ${{env.avd_name}} wait-for-device || true
+            boot=$(adb -s ${{env.avd_name}} shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')
+            if [ "$boot" = "1" ]; then
+              break
+            fi
+            sleep 5
+          done
           adb devices -l 
           adb -s ${{env.avd_name}} install --abi ${{matrix.arch}} "${{matrix.apkpath}}"
           
@@ -107,9 +154,18 @@ jobs:
           echo "$apkpkgver"         
           echo "$apkpkg"     
 
+      - name: validate package metadata
+        run: |
+          if [ -z "${{ env.apkpkgver }}" ] || [ -z "${{ env.apkpkg }}" ]; then
+            echo "Failed to parse package info from ${{ matrix.apkpath }}"
+            echo "aapt dump badging output:"
+            aapt dump badging "${{ matrix.apkpath }}" || true
+            exit 1
+          fi
+
       - name: create output dir
         run: | 
-          mkdir ${{ env.apkpkgver }}
+          mkdir -p "${{ env.apkpkgver }}"
 
       - name: aapt dump badging
         run: | 
@@ -119,8 +175,12 @@ jobs:
       - name: fix data permissions
         if: always()
         run: | 
+          set -euxo pipefail
           # stop docker containers
-          docker stop $(docker ps -a -q)
+          running=$(docker ps -aq)
+          if [ -n "$running" ]; then
+            docker stop $running
+          fi
           sudo chown -R runner:runner data
 
       - name: compress archive data
@@ -130,16 +190,16 @@ jobs:
       
       - name: Upload data
         uses: actions/upload-artifact@v4
-        if: always()
+        if: ${{ always() && env.apkpkgver != '' }}
         with:
-            name: all_package_data
+            name: all_package_data-${{ env.apkpkgver }}-${{ matrix.arch }}
             path: ${{ env.apkpkgver }}
             retention-days: 25
             
       - name: Upload all data
         uses: actions/upload-artifact@v4
-        if: always()
+        if: ${{ always() && env.apkpkgver != '' }}
         with:
-            name: all_data
+            name: all_data-${{ env.apkpkgver }}-${{ matrix.arch }}
             path: data-${{ env.apkpkgver }}-${{matrix.arch}}/data/
             retention-days: 5
